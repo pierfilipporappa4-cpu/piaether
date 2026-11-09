@@ -30,3 +30,88 @@ export class FistDeleteGesture{
   return result;
  }
 }
+
+const visiblePoint=p=>p&&Number.isFinite(p.x)&&Number.isFinite(p.y)&&(p.visibility??1)>.3;
+const midpoint=(a,b)=>({x:(a.x+b.x)/2,y:(a.y+b.y)/2});
+export function describePerson(lm,index=0){
+ if(!visiblePoint(lm[11])||!visiblePoint(lm[12]))return null;
+ const shoulders=midpoint(lm[11],lm[12]),span=Math.max(.04,distance(lm[11],lm[12]));
+ const hips=visiblePoint(lm[23])&&visiblePoint(lm[24])?midpoint(lm[23],lm[24]):{x:shoulders.x,y:shoulders.y+span*1.4};
+ const center=midpoint(shoulders,hips),points=lm.filter(visiblePoint);
+ const x=Math.max(0,Math.min(...points.map(p=>p.x))-span*.35-.035),y=Math.max(0,Math.min(...points.map(p=>p.y))-span*.35-.035);
+ const right=Math.min(1,Math.max(...points.map(p=>p.x))+span*.35+.035),bottom=Math.min(1,Math.max(...points.map(p=>p.y))+span*.35+.035);
+ return {lm,index,shoulders,center,span,roi:{x,y,w:Math.max(.1,right-x),h:Math.max(.1,bottom-y)}};
+}
+export class SubjectSelector{
+ constructor(){this.reset()}
+ reset(){this.active=null;this.lastSeen=-Infinity;this.people=[];this.serial=0}
+ update(landmarks,t){
+  this.people=landmarks.map(describePerson).filter(Boolean);
+  if(this.active){
+   const old=this.active;const scored=this.people.map(p=>({p,c:distance(p.shoulders,old.shoulders)/Math.max(old.span,.1)+Math.abs(Math.log(p.span/old.span))*.8})).sort((a,b)=>a.c-b.c);
+   if(scored[0]?.c<1.25){this.active={...scored[0].p,id:old.id};this.lastSeen=t;return this.active}
+   if(t-this.lastSeen<180)return {...this.active,index:-1,predicted:true};
+   if(t-this.lastSeen<320)return null;
+   this.active=null;
+  }
+  if(!this.people.length)return null;
+  const p=[...this.people].sort((a,b)=>(b.span/(1+Math.abs(b.center.x-.5)*2))-(a.span/(1+Math.abs(a.center.x-.5)*2)))[0];
+  this.active={...p,id:++this.serial};this.lastSeen=t;return this.active;
+ }
+ selectAt(p,t){
+  const choices=this.people.filter(person=>contains(person.roi,p)).sort((a,b)=>distance(a.center,p)-distance(b.center,p));
+  if(!choices.length)return null;
+  this.active={...choices[0],id:++this.serial};this.lastSeen=t;return this.active;
+ }
+}
+export function remapHands(result,roi){
+ return {landmarks:(result.landmarks||[]).map(lm=>lm.map(p=>({...p,x:roi.x+p.x*roi.w,y:roi.y+p.y*roi.h,z:(p.z||0)*roi.w}))),handedness:result.handedness||[]};
+}
+export function mergeHands(...results){
+ const landmarks=[],handedness=[];
+ for(const result of results)for(let i=0;i<result.landmarks.length;i++){
+  const lm=result.landmarks[i];if(landmarks.some(existing=>distance(existing[0],lm[0])<.025&&distance(existing[9],lm[9])<.025))continue;
+  landmarks.push(lm);handedness.push(result.handedness?.[i]||[]);
+ }
+ return {landmarks,handedness};
+}
+export function handRegion(person){
+ const points=person.lm.slice(0,23).filter(p=>p&&Number.isFinite(p.x)&&Number.isFinite(p.y)&&(p.visibility??1)>.12);
+ const pad=Math.max(.06,person.span*.6),x=Math.max(0,Math.min(...points.map(p=>p.x))-pad),y=Math.max(0,Math.min(...points.map(p=>p.y))-pad*.7);
+ const right=Math.min(1,Math.max(...points.map(p=>p.x))+pad),bottom=Math.min(1,Math.max(...points.map(p=>p.y))+pad);
+ return {x,y,w:Math.max(.15,right-x),h:Math.max(.15,bottom-y)};
+}
+export function handSearchRegion(person,key,width,height,previous=[]){
+ const left=key==='Left',indices=left?[15,17,19,21]:[16,18,20,22];
+ const old=previous.find(h=>h.key===key),points=indices.map(i=>person.lm[i]).filter(p=>p&&Number.isFinite(p.x)&&Number.isFinite(p.y)&&(p.visibility??1)>.08);
+ if(!old&&!points.length)return null;
+ const center=old?midpoint(old.lm[0],old.lm[9]):points.reduce((a,p)=>({x:a.x+p.x/points.length,y:a.y+p.y/points.length}),{x:0,y:0});
+ const size=Math.max(150,person.span*width*1.15),w=Math.min(1,size/width),h=Math.min(1,size/height);
+ return {x:Math.max(0,Math.min(1-w,center.x-w/2)),y:Math.max(0,Math.min(1-h,center.y-h/2)),w,h};
+}
+export function associateHands(result,roi,person,people=[],previous=[]){
+ if(!person)return {landmarks:[],handedness:[]};
+ const mapped=remapHands(result,roi).landmarks,slots=[{index:15,elbow:13,key:'Left'},{index:16,elbow:14,key:'Right'}];
+ const choices=slots.map(slot=>{
+  const old=previous.find(h=>h.key===slot.key),wrist=person.lm[slot.index],elbow=person.lm[slot.elbow];
+  const reliable=wrist&&Number.isFinite(wrist.x)&&Number.isFinite(wrist.y)&&(wrist.visibility??1)>.08;
+  if(!reliable&&!old)return [];
+  const target=reliable?wrist:old.lm[0],limit=Math.max(.085,person.span*.9,visiblePoint(elbow)?distance(target,elbow)*.9:0),list=[];
+  for(let i=0;i<mapped.length;i++){
+   const d=distance(mapped[i][0],target),continuity=old?distance(mapped[i][0],old.lm[0]):Infinity;
+   if(d>limit&&continuity>person.span*.65)continue;
+   let rival=Infinity;
+   for(const other of people){if(other.index===person.index)continue;for(const n of [15,16])if(visiblePoint(other.lm[n]))rival=Math.min(rival,distance(mapped[i][0],other.lm[n]));}
+   if(rival<d*.55&&d>person.span*.2&&continuity>person.span*.3)continue;
+   const score=d/limit*.75+(old?Math.min(1.5,continuity/limit)*.25:0);
+   if(score<1.25)list.push({i,slot,score});
+  }
+  return list;
+ });
+ let best=[],bestScore=3;
+ for(const a of [null,...choices[0]])for(const b of [null,...choices[1]]){
+  if(a&&b&&a.i===b.i)continue;
+  const score=(a?a.score:1.5)+(b?b.score:1.5);if(score<bestScore){bestScore=score;best=[a,b].filter(Boolean);}
+ }
+ return {landmarks:best.map(c=>mapped[c.i]),handedness:best.map(c=>[{categoryName:c.slot.key}])};
+}
